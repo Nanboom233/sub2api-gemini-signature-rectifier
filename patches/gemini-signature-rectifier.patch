@@ -98,7 +98,26 @@ diff --git a/backend/internal/service/gemini_messages_compat_service.go b/backen
 index 74b537b..fac0c2f 100644
 --- a/backend/internal/service/gemini_messages_compat_service.go
 +++ b/backend/internal/service/gemini_messages_compat_service.go
-@@ -1274,6 +1274,26 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+@@ -1123,6 +1123,15 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+-	// Some Gemini upstreams validate tool call parts strictly; ensure any `functionCall` part includes a
+-	// `thoughtSignature` to avoid frequent INVALID_ARGUMENT 400s.
+-	body = ensureGeminiFunctionCallThoughtSignatures(body)
++	rectifierEnabled := false
++	if s.rateLimitService != nil && s.rateLimitService.settingService != nil {
++		rectifierEnabled = s.rateLimitService.settingService.IsGeminiNativeSignatureRectifierEnabled(ctx)
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++	}
++	if rectifierEnabled {
++		body, _ = sanitizeGeminiNativeThoughtSignatures(body, isGeminiNativeVertexTarget(account, action), false)
++	} else {
++		body = ensureGeminiFunctionCallThoughtSignatures(body)
++	}
+ 
+ 	mappedModel := originalModel
+ 	if account.Type == AccountTypeAPIKey || account.Type == AccountTypeServiceAccount {
+@@ -1274,6 +1283,35 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
  	}
  
  	var resp *http.Response
@@ -122,39 +141,42 @@ index 74b537b..fac0c2f 100644
 +			Detail:             detail,
 +		})
 +	}
++	recordRetryReqErr := func(err error) {
++		if !isSignatureRetryAttempt {
++			return
++		}
++		isSignatureRetryAttempt = false
++		if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
++			recordSignatureError("signature_retry_request_error", 0, nil, err.Error(), "")
++		}
++	}
  	// checkedPolicy 是循环内对当前 resp 的错误策略检查结果，未检查时为 nil。
  	var checkedPolicy *ErrorPolicyResult
  	maxAttempts := s.geminiMaxAttemptsPerAccount()
-@@ -1281,6 +1301,12 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+@@ -1281,6 +1319,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
  		checkedPolicy = nil
  		upstreamReq, idHeader, err := buildReq(ctx)
  		if err != nil {
-+			if isSignatureRetryAttempt {
-+				isSignatureRetryAttempt = false
-+				if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-+					recordSignatureError("signature_retry_request_error", 0, nil, err.Error(), "")
-+				}
-+			}
++			recordRetryReqErr(err)
  			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
  				return nil, err
  			}
-@@ -1297,6 +1323,12 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+@@ -1297,6 +1336,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
  
  		resp, err = s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
  		if err != nil {
-+			if isSignatureRetryAttempt {
-+				isSignatureRetryAttempt = false
-+				if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-+					recordSignatureError("signature_retry_request_error", 0, nil, err.Error(), "")
-+				}
-+			}
++			recordRetryReqErr(err)
  			transportErr := s.handleUpstreamTransportError(ctx, c, account, err)
  			// countTokens 不因上游链路故障而失败：本地估算兜底，不换号。
  			var failoverErr *UpstreamFailoverError
-@@ -1316,6 +1348,16 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+@@ -1316,6 +1356,20 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
  			return nil, transportErr
  		}
  
++		if err := ctx.Err(); err != nil {
++			_ = resp.Body.Close()
++			return nil, err
++		}
 +		if isSignatureRetryAttempt {
 +			isSignatureRetryAttempt = false
 +			if resp.StatusCode >= 400 {
@@ -168,23 +190,16 @@ index 74b537b..fac0c2f 100644
  		// 引用缓存不存在、上游网关持有缓存的账号不可用先于错误策略识别：错误策略会写临时不可调度，
  		// 重试与换号也无法恢复。
  		if passthrough, rebuilt := s.cachedContentPassthroughInLoop(ctx, account, resp); passthrough {
-@@ -1333,6 +1375,29 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+@@ -1333,6 +1387,23 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
  			break
  		}
  
-+		if resp.StatusCode == http.StatusBadRequest && !signatureRecoveryUsed {
++		if resp.StatusCode == http.StatusBadRequest && !signatureRecoveryUsed && rectifierEnabled {
 +			respBody := s.readUpstreamErrorBody(resp)
 +			_ = resp.Body.Close()
-+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
-+			rectifierEnabled := isGeminiNativeSignatureRelatedError(respBody) && s.rateLimitService != nil && s.rateLimitService.settingService != nil && s.rateLimitService.settingService.IsGeminiNativeSignatureRectifierEnabled(ctx)
-+			if err := ctx.Err(); err != nil {
-+				_ = resp.Body.Close()
-+				return nil, err
-+			}
-+			if rectifierEnabled {
-+				if cleaned, changed := cleanGeminiNativeThoughtSignaturesForRetry(body); changed {
++			if isGeminiNativeSignatureRelatedError(respBody) {
++				if cleaned, changed := sanitizeGeminiNativeThoughtSignatures(body, false, true); changed {
 +					recordSignatureError("signature_error", resp.StatusCode, resp.Header, extractUpstreamErrorMessage(respBody), s.upstreamErrorDetail(respBody))
-+					_ = resp.Body.Close()
 +					body = cleaned
 +					signatureRecoveryUsed = true
 +					isSignatureRetryAttempt = true
@@ -193,6 +208,7 @@ index 74b537b..fac0c2f 100644
 +					continue
 +				}
 +			}
++			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 +		}
 +
  		if resp.StatusCode >= 400 && s.shouldRetryGeminiUpstreamError(account, resp.StatusCode) {
@@ -202,16 +218,21 @@ diff --git a/backend/internal/service/gemini_native_signature_cleaner.go b/backe
 index d43fb44..6aa01a7 100644
 --- a/backend/internal/service/gemini_native_signature_cleaner.go
 +++ b/backend/internal/service/gemini_native_signature_cleaner.go
-@@ -2,10 +2,124 @@ package service
+@@ -2,10 +2,229 @@ package service
  
  import (
++	"encoding/base64"
  	"encoding/json"
++	"net/url"
 +	"strings"
 +	"unicode"
  
  	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
++	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
++	"google.golang.org/protobuf/encoding/protowire"
  )
  
++// isGeminiNativeSignatureRelatedError matches only the extracted upstream error message.
 +func isGeminiNativeSignatureRelatedError(body []byte) bool {
 +	message := strings.Map(func(r rune) rune {
 +		if r == '_' || unicode.IsSpace(r) {
@@ -222,8 +243,79 @@ index d43fb44..6aa01a7 100644
 +	return strings.Contains(message, "thoughtsignature")
 +}
 +
-+// cleanGeminiNativeThoughtSignaturesForRetry changes only direct Part signature metadata.
-+func cleanGeminiNativeThoughtSignaturesForRetry(body []byte) ([]byte, bool) {
++// isGeminiNativeVertexTarget classifies the builder target without changing URL validation.
++func isGeminiNativeVertexTarget(account *Account, action string) bool {
++	if account.IsVertexServiceAccount() {
++		return true
++	}
++	if account.Type != AccountTypeAPIKey && account.Type != AccountTypeOAuth {
++		return false
++	}
++	if account.Type == AccountTypeOAuth && action != "countTokens" && strings.TrimSpace(account.GetCredential("project_id")) != "" {
++		return false
++	}
++	target, err := url.Parse(account.GetGeminiBaseURL(geminicli.AIStudioBaseURL))
++	if err != nil {
++		return false
++	}
++	host := strings.ToLower(target.Hostname())
++	return host == "aiplatform.googleapis.com" || host == "aiplatform.us.rep.googleapis.com" ||
++		host == "aiplatform.eu.rep.googleapis.com" ||
++		(strings.HasSuffix(host, "-aiplatform.googleapis.com") && host != "-aiplatform.googleapis.com")
++}
++
++// replayGeminiNativeThoughtSignature permits compatible envelopes and first-call bypass values.
++func replayGeminiNativeThoughtSignature(raw string, allowBareTink, allowBypass bool) string {
++	sig := strings.TrimSpace(raw)
++	if sig == "" {
++		return ""
++	}
++	if sig == geminiDummyThoughtSignature || sig == "context_engineering_is_the_way_to_go" {
++		if allowBypass {
++			return sig
++		}
++		return ""
++	}
++	decoded, err := base64.StdEncoding.DecodeString(sig)
++	if err != nil {
++		decoded, err = base64.RawStdEncoding.DecodeString(sig)
++	}
++	if err != nil || len(decoded) == 0 {
++		return ""
++	}
++	if allowBareTink && len(decoded) >= 21 && decoded[0] == 0x01 &&
++		[4]byte(decoded[1:5]) == [4]byte{0x8f, 0x3d, 0x6b, 0x5f} {
++		return sig
++	}
++	number, wireType, size := protowire.ConsumeTag(decoded)
++	if size < 0 || number != 2 || wireType != protowire.BytesType {
++		return ""
++	}
++	container, consumed := protowire.ConsumeBytes(decoded[size:])
++	if consumed < 0 || size+consumed != len(decoded) {
++		return ""
++	}
++	number, wireType, size = protowire.ConsumeTag(container)
++	if size < 0 || number != 1 || wireType != protowire.BytesType {
++		return ""
++	}
++	value, consumed := protowire.ConsumeBytes(container[size:])
++	if consumed < 0 || size+consumed != len(container) || len(value) == 0 {
++		return ""
++	}
++	return sig
++}
++
++// hasPartKey checks either spelling of a direct Part key.
++func hasPartKey(part map[string]json.RawMessage, a, b string) bool {
++	_, hasA := part[a]
++	_, hasB := part[b]
++	return hasA || hasB
++}
++
++// sanitizeGeminiNativeThoughtSignatures edits direct Part metadata and groups retained calls.
++// Force mode clears rejected signatures and true thought flags on non-call Parts.
++func sanitizeGeminiNativeThoughtSignatures(body []byte, allowBareTink, force bool) ([]byte, bool) {
 +	var request map[string]json.RawMessage
 +	if err := json.Unmarshal(body, &request); err != nil {
 +		return body, false
@@ -243,6 +335,12 @@ index d43fb44..6aa01a7 100644
 +		if err := json.Unmarshal(content["parts"], &parts); err != nil {
 +			return body, false
 +		}
++		eligibleRole := true
++		if rawRole, ok := content["role"]; ok {
++			var role *string
++			eligibleRole = json.Unmarshal(rawRole, &role) == nil && role != nil && (*role == "model" || *role == "")
++		}
++		firstCallSeen := false
 +		contentChanged := false
 +		cleanedParts := make([]json.RawMessage, 0, len(parts))
 +		for _, rawPart := range parts {
@@ -250,38 +348,58 @@ index d43fb44..6aa01a7 100644
 +			if err := json.Unmarshal(rawPart, &part); err != nil {
 +				return body, false
 +			}
-+			_, camelCall := part["functionCall"]
-+			_, snakeCall := part["function_call"]
-+			_, camelSignature := part["thoughtSignature"]
-+			_, snakeSignature := part["thought_signature"]
++			if hasPartKey(part, "toolCall", "tool_call") || hasPartKey(part, "toolResponse", "tool_response") {
++				cleanedParts = append(cleanedParts, rawPart)
++				continue
++			}
++			hasResponse := hasPartKey(part, "functionResponse", "function_response")
++			if !force && !eligibleRole && !hasResponse {
++				cleanedParts = append(cleanedParts, rawPart)
++				continue
++			}
++			hasCall := hasPartKey(part, "functionCall", "function_call") && !hasResponse
++			rawSignature, camelSignature := part["thoughtSignature"]
++			snakeValue, snakeSignature := part["thought_signature"]
++			if !camelSignature {
++				rawSignature = snakeValue
++			}
++			var signature string
++			if rawSignature != nil {
++				_ = json.Unmarshal(rawSignature, &signature)
++			}
++			var thought bool
++			_ = json.Unmarshal(part["thought"], &thought)
++			replaySignature := ""
++			if !hasResponse && !force {
++				replaySignature = replayGeminiNativeThoughtSignature(signature, allowBareTink, hasCall && !firstCallSeen)
++			}
++			if hasCall && !firstCallSeen && replaySignature == "" {
++				replaySignature = geminiDummyThoughtSignature
++			}
 +			partChanged := false
-+			if camelCall || snakeCall {
-+				var signature string
-+				_ = json.Unmarshal(part["thoughtSignature"], &signature)
-+				if signature != geminiDummyThoughtSignature || snakeSignature {
-+					part["thoughtSignature"], _ = json.Marshal(geminiDummyThoughtSignature)
++			if replaySignature != "" {
++				if !camelSignature || signature != replaySignature || snakeSignature {
++					part["thoughtSignature"], _ = json.Marshal(replaySignature)
 +					delete(part, "thought_signature")
 +					partChanged = true
 +				}
-+			} else {
-+				var thought bool
-+				_ = json.Unmarshal(part["thought"], &thought)
-+				if camelSignature || snakeSignature || thought {
-+					delete(part, "thoughtSignature")
-+					delete(part, "thought_signature")
-+					if thought {
-+						delete(part, "thought")
-+					}
-+					partChanged = true
-+					var text string
-+					emptyText := len(part) == 1 && json.Unmarshal(part["text"], &text) == nil && text == ""
-+					if len(part) == 0 || emptyText {
-+						contentChanged = true
-+						continue
-+					}
-+				}
++			} else if camelSignature || snakeSignature {
++				delete(part, "thoughtSignature")
++				delete(part, "thought_signature")
++				partChanged = true
++			}
++			if force && !hasCall && thought {
++				delete(part, "thought")
++				thought = false
++				partChanged = true
 +			}
 +			if partChanged {
++				var text string
++				emptyText := len(part) == 1 && json.Unmarshal(part["text"], &text) == nil && text == ""
++				if len(part) == 0 || emptyText {
++					contentChanged = true
++					continue
++				}
 +				var err error
 +				rawPart, err = json.Marshal(part)
 +				if err != nil {
@@ -290,6 +408,9 @@ index d43fb44..6aa01a7 100644
 +				contentChanged = true
 +			}
 +			cleanedParts = append(cleanedParts, rawPart)
++			if !hasResponse && (hasCall || !thought) {
++				firstCallSeen = hasCall
++			}
 +		}
 +		if contentChanged && len(cleanedParts) == 0 {
 +			changed = true
@@ -390,7 +511,7 @@ index 868097a..56d87b3 100644
          thinkingSignature: 'Thinking Signature Rectifier',
          thinkingSignatureHint: 'Automatically strip signatures and retry when upstream returns thinking block signature validation errors',
 +        geminiNativeSignature: 'Gemini Native Signature Rectifier',
-+        geminiNativeSignatureHint: 'Fix rejected thought signatures and retry native Gemini requests once. Configured error policies take priority.',
++        geminiNativeSignatureHint: 'Normalize incompatible thought signatures before native Gemini requests. Retry a rejected request once when error policies allow it.',
          thinkingBudget: 'Thinking Budget Rectifier',
          thinkingBudgetHint: 'Automatically set budget to 32000 and retry when upstream returns budget_tokens constraint error (≥1024)',
          apikeySignature: 'API Key Signature Rectifier',
@@ -403,7 +524,7 @@ index 31c2dba..ff84aed 100644
          thinkingSignature: 'Thinking 签名整流',
          thinkingSignatureHint: '当上游返回 thinking block 签名校验错误时，自动去除签名并重试',
 +        geminiNativeSignature: 'Gemini 原生签名整流',
-+        geminiNativeSignatureHint: '原生 Gemini 请求遇到思考签名错误时，修正后重试一次。已配置的错误策略优先。',
++        geminiNativeSignatureHint: '发送原生 Gemini 请求前规范化不兼容的思考签名。错误策略允许时，对被拒绝的请求重试一次。',
          thinkingBudget: 'Thinking Budget 整流',
          thinkingBudgetHint: '当上游返回 budget_tokens 约束错误（≥1024）时，自动将 budget 设为 32000 并重试',
          apikeySignature: 'API Key 签名整流',

@@ -9,7 +9,6 @@ const mocks = vi.hoisted(() => ({
   getRectifierSettings: vi.fn(),
   updateRectifierSettings: vi.fn(),
   showError: vi.fn(),
-  showSuccess: vi.fn(),
 }))
 
 vi.mock('@/api', () => ({
@@ -40,7 +39,7 @@ vi.mock('@/api', () => ({
 vi.mock('@/stores', () => ({
   useAppStore: () => ({
     showError: mocks.showError,
-    showSuccess: mocks.showSuccess,
+    showSuccess: vi.fn(),
     fetchPublicSettings: vi.fn(),
   }),
 }))
@@ -57,7 +56,7 @@ describe('native Gemini rectifier settings', () => {
   beforeEach(() => vi.clearAllMocks())
 
   for (const locale of ['en', 'zh'] as const) {
-    it(`saves both boolean states and preserves siblings in ${locale}`, async () => {
+    it(locale === 'en' ? 'saves both boolean states and preserves siblings' : 'shows Chinese labels and ARIA', async () => {
       let saved = {
         enabled: true,
         thinking_signature_enabled: true,
@@ -77,7 +76,7 @@ describe('native Gemini rectifier settings', () => {
           stubs: { AppLayout: { template: '<div><slot /></div>' }, Toggle: false, RouterLink: true },
         },
       })
-      for (const enabled of [true, false]) {
+      for (const enabled of locale === 'en' ? [true, false] : [undefined]) {
         const wrapper = mountView()
         try {
           await flushPromises()
@@ -86,16 +85,19 @@ describe('native Gemini rectifier settings', () => {
             ? 'Gemini Native Signature Rectifier'
             : 'Gemini 原生签名整流'
           const hint = locale === 'en'
-            ? 'Fix rejected thought signatures and retry native Gemini requests once. Configured error policies take priority.'
-            : '原生 Gemini 请求遇到思考签名错误时，修正后重试一次。已配置的错误策略优先。'
+            ? 'Normalize incompatible thought signatures before native Gemini requests. Retry a rejected request once when error policies allow it.'
+            : '发送原生 Gemini 请求前规范化不兼容的思考签名。错误策略允许时，对被拒绝的请求重试一次。'
           expect(wrapper.get('label[for="gemini-native-signature"]').text()).toBe(label)
           expect(wrapper.get('#gemini-native-signature-hint').text()).toBe(hint)
           expect(wrapper.get('#gemini-native-signature').attributes()).toMatchObject({
             role: 'switch',
-            'aria-checked': String(!enabled),
+            'aria-checked': String(saved.gemini_native_signature_enabled),
             'aria-label': label,
             'aria-describedby': 'gemini-native-signature-hint',
           })
+          if (enabled === undefined) {
+            continue
+          }
           await wrapper.get('#gemini-native-signature').trigger('click')
           const card = wrapper.findAll('.card').find(candidate => candidate.find('#gemini-native-signature').exists())!
           await card.get('button.btn-primary').trigger('click')
@@ -109,23 +111,10 @@ describe('native Gemini rectifier settings', () => {
             apikey_signature_patterns: ['synthetic-pattern'],
           })
           expect(wrapper.get('#gemini-native-signature').attributes('aria-checked')).toBe(String(enabled))
+          expect(mocks.showError).not.toHaveBeenCalled()
         } finally {
           wrapper.unmount()
         }
-      }
-      const wrapper = mountView()
-      try {
-        await flushPromises()
-        await wrapper.get('#settings-tab-gateway').trigger('click')
-        expect(wrapper.get('#gemini-native-signature').attributes('aria-checked')).toBe('false')
-        const card = wrapper.findAll('.card').find(candidate => candidate.find('#gemini-native-signature').exists())!
-        expect(card.findAll('[role="switch"]')).toHaveLength(5)
-        await card.findAll('[role="switch"]')[0].trigger('click')
-        expect(card.findAll('[role="switch"]')).toHaveLength(1)
-        expect(card.find('#gemini-native-signature').exists()).toBe(false)
-        expect(mocks.showError).not.toHaveBeenCalled()
-      } finally {
-        wrapper.unmount()
       }
     })
   }

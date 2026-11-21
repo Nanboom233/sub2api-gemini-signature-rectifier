@@ -27,10 +27,10 @@ func TestNativeRectifierDefaultAndGate(t *testing.T) {
 		err   error
 		want  bool
 	}{
-		{"both on", `{"enabled":true,"gemini_native_signature_enabled":true}`, nil, true},
+		{"missing field", `{"enabled":true}`, nil, false},
 		{"master off", `{"enabled":false,"gemini_native_signature_enabled":true}`, nil, false},
 		{"option off", `{"enabled":true,"gemini_native_signature_enabled":false,"thinking_signature_enabled":true,"apikey_signature_enabled":true}`, nil, false},
-		{"unrelated off", `{"enabled":true,"gemini_native_signature_enabled":true,"thinking_signature_enabled":false,"apikey_signature_enabled":false}`, nil, true},
+		{"both on ignores unrelated switches", `{"enabled":true,"gemini_native_signature_enabled":true,"thinking_signature_enabled":false,"apikey_signature_enabled":false}`, nil, true},
 		{"read error", "", errors.New("synthetic settings failure"), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
